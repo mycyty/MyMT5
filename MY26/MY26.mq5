@@ -9,7 +9,7 @@
 #property link      ""
 #property version   "1.00"
 
-input string InpSymbol            = "XAUUSD";
+input string InpSymbol            = "XAUUSDm";
 input long   InpMagicNumber       = 26026;
 input double InpAtrMin            = 1.0;
 input int    InpMaFastPeriod      = 60;
