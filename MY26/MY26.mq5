@@ -11,16 +11,23 @@
 
 input string InpSymbol            = "XAUUSDm";
 input long   InpMagicNumber       = 26026;
-input double InpAtrMin            = 1.0;
+input double InpAtrMin            = 2.0;
 input int    InpMaFastPeriod      = 60;
 input int    InpMaSlowPeriod      = 250;
 input int    InpMaTrendBars       = 5;        // 5 根已收盘K线单调上升/下降
-input double InpPendingDistance   = 2000.0;   // 价格差（非 points）
-input double InpMaSlOffset        = 10.0;     // 价格差（非 points）
+input int    InpNoPendingDirection = 0;       // 无挂单时: 0=不交易, 1=仅允许多, -1=仅允许空（量化测试）
+input double InpSlAtrMult         = 16.0;     // 止损距离 = 该系数 × ATR(shift=1 已收盘)
+input double InpTpAtrMult         = 0.5;      // 止盈距离 = 该系数 × ATR(shift=1 已收盘)
 input double InpAoExtremeLong     = -1.0;
 input double InpAoExtremeShort    = 1.0;
 
 static const ENUM_TIMEFRAMES Tf = PERIOD_M1;
+
+// 挂单与现价最小距离（价格差，非 points）
+const double PENDING_DISTANCE = 2000.0;
+
+// true：开仓要求快线在最近 InpMaTrendBars 根已收盘K上方向单调；false：不检查快线单调，仅慢线单调仍参与
+bool g_RequireFastMaMonotonic = false;
 
 CTrade trade;
 
@@ -234,7 +241,27 @@ bool PendingGate(double &lotsLong, double &lotsShort, bool &allowLong, bool &all
 
    int total = OrdersTotal();
    if(total <= 0)
-      return false; // 没有任何挂单：完全不交易
+     {
+      if(InpNoPendingDirection == 0)
+         return false;
+      double minLot = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
+      if(minLot <= 0.0)
+         return false;
+      if(InpNoPendingDirection == 1)
+        {
+         allowLong = true;
+         lotsLong = minLot;
+        }
+      else
+         if(InpNoPendingDirection == -1)
+           {
+            allowShort = true;
+            lotsShort = minLot;
+           }
+         else
+            return false;
+      return true;
+     }
 
    double bid = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(InpSymbol, SYMBOL_ASK);
@@ -265,13 +292,13 @@ bool PendingGate(double &lotsLong, double &lotsShort, bool &allowLong, bool &all
 
       if(isBuyPending)
         {
-         if(price < (refLong - InpPendingDistance))
+         if(price < (refLong - PENDING_DISTANCE))
             lotsLong += vol;
         }
       else
          if(isSellPending)
            {
-            if(price > (refShort + InpPendingDistance))
+            if(price > (refShort + PENDING_DISTANCE))
                lotsShort += vol;
            }
      }
@@ -423,12 +450,11 @@ void OnTick()
 
    SyncTracked();
 
-// 挂单门控
+// 挂单门控（无挂单时可通过 InpNoPendingDirection 强制单侧测试）
    double lotsLong = 0.0, lotsShort = 0.0;
    bool allowLong = false, allowShort = false;
-   bool hasAnyPending = PendingGate(lotsLong, lotsShort, allowLong, allowShort);
-   if(!hasAnyPending)
-      return; // 无挂单：完全不交易
+   if(!PendingGate(lotsLong, lotsShort, allowLong, allowShort))
+      return;
 
 // 两侧同时满足或两侧都不满足：不交易
    if((allowLong && allowShort) || (!allowLong && !allowShort))
@@ -451,9 +477,13 @@ void OnTick()
    if(atrVal < InpAtrMin)
       return;
 
-// MA 趋势（最近 5 根已收盘：shift 1..trendBars）
-   bool maUp = IsMonotonicUp(maFast, 1, InpMaTrendBars) && IsMonotonicUp(maSlow, 1, InpMaTrendBars);
-   bool maDown = IsMonotonicDown(maFast, 1, InpMaTrendBars) && IsMonotonicDown(maSlow, 1, InpMaTrendBars);
+// MA 趋势（最近 5 根已收盘：shift 1..trendBars）；快线单调由 g_RequireFastMaMonotonic 控制
+   bool slowUp = IsMonotonicUp(maSlow, 1, InpMaTrendBars);
+   bool slowDown = IsMonotonicDown(maSlow, 1, InpMaTrendBars);
+   bool fastUp = IsMonotonicUp(maFast, 1, InpMaTrendBars);
+   bool fastDown = IsMonotonicDown(maFast, 1, InpMaTrendBars);
+   bool maUp = slowUp && (g_RequireFastMaMonotonic ? fastUp : true);
+   bool maDown = slowDown && (g_RequireFastMaMonotonic ? fastDown : true);
 
    bool maBull = (maFast[1] > maSlow[1]) && maUp;
    bool maBear = (maFast[1] < maSlow[1]) && maDown;
@@ -488,8 +518,8 @@ void OnTick()
          return;
 
       double entry = ask;
-      double tp = NormalizePrice(entry + atrVal / 2.0);
-      double sl = NormalizePrice(maSlow[1] - InpMaSlOffset);
+      double tp = NormalizePrice(entry + InpTpAtrMult * atrVal);
+      double sl = NormalizePrice(entry - InpSlAtrMult * atrVal);
       if(!(sl < entry && tp > entry))
          return;
       OpenBuy(vol, tp, sl);
@@ -503,8 +533,8 @@ void OnTick()
          return;
 
       double entry = bid;
-      double tp = NormalizePrice(entry - atrVal / 2.0);
-      double sl = NormalizePrice(maSlow[1] + InpMaSlOffset);
+      double tp = NormalizePrice(entry - InpTpAtrMult * atrVal);
+      double sl = NormalizePrice(entry + InpSlAtrMult * atrVal);
       if(!(sl > entry && tp < entry))
          return;
       OpenSell(vol, tp, sl);
