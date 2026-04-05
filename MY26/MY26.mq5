@@ -20,10 +20,22 @@ input double InpTpAtrMult         = 0.5;      // 止盈距离 = 该系数 × ATR
 input double InpAoExtremeLong     = -1.0;
 input double InpAoExtremeShort    = 1.0;
 
+//--- 邮件通知（默认关闭，不改变交易逻辑；收件人实际以终端「工具→选项→邮件」为准）
+input bool   InpEmailEnable            = false;   // 启用邮件
+input string InpEmailAddress           = "";      // 备注用收件邮箱（SendMail 仍走终端配置）
+
 static const ENUM_TIMEFRAMES Tf = PERIOD_M1;
 
 // 挂单与现价最小距离（价格差，非 points）
 const double PENDING_DISTANCE = 2000.0;
+
+// 邮件子选项（源码常量，非输入参数）
+const bool   g_EmailNotifyOpen        = true;    // 开仓成交通知
+const bool   g_EmailNotifyClose       = true;    // 平仓成交通知
+const bool   g_EmailNotifyModify      = false;   // 修改/对冲类成交（INOUT）
+const bool   g_EmailPriceNotify       = false;   // 价格跨区间通知（每 tick，与 InpSymbol 一致）
+const int    g_EmailPriceIntervalMin  = 5;      // 价格邮件最小间隔（分钟）
+const double g_EmailPriceStep         = 5.0;    // 价格区间步长
 
 // 无挂单时: 0=不交易, 1=仅允许多, -1=仅允许空（量化测试）
 const int g_InpNoPendingDirection = 0;
@@ -39,6 +51,12 @@ int atrHandle    = INVALID_HANDLE;
 int aoHandle     = INVALID_HANDLE;
 
 datetime lastBarTime = 0;
+
+// 邮件：去重与价格区间状态（仅 InpEmailEnable 时使用）
+datetime mailLastDealTime           = 0;
+datetime mailLastPriceNotifyTime    = 0;
+int      mailPriceLevel             = 0;
+bool     mailPriceMonitorInitialized = false;
 
 ulong longTickets[];
 ulong shortTickets[];
@@ -402,12 +420,298 @@ bool OpenSell(double vol, double tp, double sl)
   }
 
 //+------------------------------------------------------------------+
+//| 邮件：仅通知本 EA 魔术号 + InpSymbol 的成交（与 TradeMailNotification 同源逻辑） |
+//+------------------------------------------------------------------+
+void MailNotif_SendTrade(ulong dealTicket, const string action, ENUM_DEAL_TYPE dealType, datetime dealTime)
+  {
+   string symbol = HistoryDealGetString(dealTicket, DEAL_SYMBOL);
+   double volume = HistoryDealGetDouble(dealTicket, DEAL_VOLUME);
+   double price = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+
+   string dealTypeStr = "";
+   switch(dealType)
+     {
+      case DEAL_TYPE_BUY:
+         dealTypeStr = "买入";
+         break;
+      case DEAL_TYPE_SELL:
+         dealTypeStr = "卖出";
+         break;
+      case DEAL_TYPE_BALANCE:
+         dealTypeStr = "余额";
+         break;
+      case DEAL_TYPE_CREDIT:
+         dealTypeStr = "信用";
+         break;
+      case DEAL_TYPE_CHARGE:
+         dealTypeStr = "费用";
+         break;
+      case DEAL_TYPE_CORRECTION:
+         dealTypeStr = "修正";
+         break;
+      case DEAL_TYPE_BONUS:
+         dealTypeStr = "奖金";
+         break;
+      case DEAL_TYPE_COMMISSION:
+         dealTypeStr = "佣金";
+         break;
+      case DEAL_TYPE_COMMISSION_DAILY:
+         dealTypeStr = "每日佣金";
+         break;
+      case DEAL_TYPE_COMMISSION_MONTHLY:
+         dealTypeStr = "每月佣金";
+         break;
+      case DEAL_TYPE_COMMISSION_AGENT_DAILY:
+         dealTypeStr = "代理每日佣金";
+         break;
+      case DEAL_TYPE_COMMISSION_AGENT_MONTHLY:
+         dealTypeStr = "代理每月佣金";
+         break;
+      case DEAL_TYPE_INTEREST:
+         dealTypeStr = "利息";
+         break;
+      case DEAL_TYPE_BUY_CANCELED:
+         dealTypeStr = "买入取消";
+         break;
+      case DEAL_TYPE_SELL_CANCELED:
+         dealTypeStr = "卖出取消";
+         break;
+      default:
+         dealTypeStr = "未知类型";
+     }
+
+   string timeStr = TimeToString(dealTime, TIME_DATE | TIME_SECONDS);
+   string subject = StringFormat("黄金成交%.2f手 价格%d", volume, (int)price);
+   string body = StringFormat(
+                    "MY26 交易通知\n\n" +
+                    "账户: %s\n" +
+                    "品种: %s\n" +
+                    "动作: %s\n" +
+                    "类型: %s\n" +
+                    "时间: %s\n" +
+                    "手数: %.2f\n" +
+                    "价格: %.5f\n" +
+                    "成交号: %I64u\n\n" +
+                    "---\n" +
+                    "由 MY26 EA 发送",
+                    AccountInfoString(ACCOUNT_NAME),
+                    symbol,
+                    action,
+                    dealTypeStr,
+                    timeStr,
+                    volume,
+                    price,
+                    dealTicket
+                 );
+
+   if(SendMail(subject, body))
+      Print("MY26 邮件已发送: ", subject);
+   else
+     {
+      Print("MY26 邮件发送失败, err=", GetLastError(), " 请检查终端邮件设置");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void MailNotif_ProcessDeals()
+  {
+   if(!InpEmailEnable)
+      return;
+
+   datetime currentTime = TimeCurrent();
+   if(!HistorySelect(0, currentTime))
+      return;
+
+   int totalDeals = HistoryDealsTotal();
+   if(totalDeals <= 0)
+      return;
+
+// History 按时间升序：从旧到新遍历，避免同一批多笔成交时漏通知
+   datetime maxSeen = mailLastDealTime;
+
+   for(int i = 0; i < totalDeals; i++)
+     {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0)
+         continue;
+
+      datetime dealTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+      if(dealTime <= mailLastDealTime)
+         continue;
+
+      long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+      if(dealMagic != InpMagicNumber)
+         continue;
+
+      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != InpSymbol)
+         continue;
+
+      ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
+      ENUM_DEAL_ENTRY dealEntry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+
+      bool want = (g_EmailNotifyOpen && dealEntry == DEAL_ENTRY_IN) ||
+                  (g_EmailNotifyClose && dealEntry == DEAL_ENTRY_OUT) ||
+                  (g_EmailNotifyModify && dealEntry == DEAL_ENTRY_INOUT);
+      if(!want)
+         continue;
+
+      if(dealEntry == DEAL_ENTRY_IN)
+         MailNotif_SendTrade(dealTicket, "开仓(IN)", dealType, dealTime);
+      else
+         if(dealEntry == DEAL_ENTRY_OUT)
+            MailNotif_SendTrade(dealTicket, "平仓(OUT)", dealType, dealTime);
+         else
+            MailNotif_SendTrade(dealTicket, "INOUT", dealType, dealTime);
+
+      if(dealTime > maxSeen)
+         maxSeen = dealTime;
+     }
+
+   if(maxSeen > mailLastDealTime)
+      mailLastDealTime = maxSeen;
+  }
+
+//+------------------------------------------------------------------+
+//| 初始化邮件去重时间：避免加载 EA 时对历史成交批量发信              |
+//+------------------------------------------------------------------+
+void MailNotif_SeedLastDealTime()
+  {
+   mailLastDealTime = 0;
+   if(!HistorySelect(0, TimeCurrent()))
+      return;
+
+   int n = HistoryDealsTotal();
+   datetime maxT = 0;
+   for(int i = 0; i < n; i++)
+     {
+      ulong t = HistoryDealGetTicket(i);
+      if(t == 0)
+         continue;
+      if(HistoryDealGetInteger(t, DEAL_MAGIC) != InpMagicNumber)
+         continue;
+      if(HistoryDealGetString(t, DEAL_SYMBOL) != InpSymbol)
+         continue;
+      datetime dt = (datetime)HistoryDealGetInteger(t, DEAL_TIME);
+      if(dt > maxT)
+         maxT = dt;
+     }
+   mailLastDealTime = maxT;
+  }
+
+//+------------------------------------------------------------------+
+//| 价格跨区间邮件（使用 InpSymbol 的 BID）                          |
+//+------------------------------------------------------------------+
+void MailNotif_SendPriceInterval(double currentPrice, double oldLevelPrice, double newLevelPrice,
+                                 const string direction, datetime notifyTime)
+  {
+   string timeStr = TimeToString(notifyTime, TIME_DATE | TIME_SECONDS);
+   string subject = StringFormat("黄金价格%d", (int)currentPrice);
+
+   double priceChange = currentPrice - oldLevelPrice;
+   double priceChangePercent = 0.0;
+   if(oldLevelPrice > 0.0)
+      priceChangePercent = (priceChange / oldLevelPrice) * 100.0;
+
+   string body = StringFormat(
+                    "MY26 价格区间变化\n\n" +
+                    "账户: %s\n" +
+                    "品种: %s\n" +
+                    "方向: %s\n" +
+                    "时间: %s\n\n" +
+                    "当前价: %.5f\n" +
+                    "原区间参考: %.5f\n" +
+                    "新区间参考: %.5f\n" +
+                    "变化: %.5f (%.2f%%)\n\n" +
+                    "区间步长: %.5f\n" +
+                    "最小间隔: %d 分钟\n\n" +
+                    "---\n由 MY26 EA 发送",
+                    AccountInfoString(ACCOUNT_NAME),
+                    InpSymbol,
+                    direction,
+                    timeStr,
+                    currentPrice,
+                    oldLevelPrice,
+                    newLevelPrice,
+                    priceChange,
+                    priceChangePercent,
+                    g_EmailPriceStep,
+                    g_EmailPriceIntervalMin
+                 );
+
+   if(!SendMail(subject, body))
+      Print("MY26 价格邮件失败, err=", GetLastError());
+  }
+
+//+------------------------------------------------------------------+
+//|                                                                  |
+//+------------------------------------------------------------------+
+void MailNotif_CheckPriceInterval()
+  {
+   if(!InpEmailEnable || !g_EmailPriceNotify)
+      return;
+
+   double step = g_EmailPriceStep;
+   if(step <= 0.0)
+      return;
+
+   double currentPrice = SymbolInfoDouble(InpSymbol, SYMBOL_BID);
+   if(currentPrice <= 0.0)
+      return;
+
+   int newLevel = (int)MathFloor(currentPrice / step);
+
+   if(!mailPriceMonitorInitialized)
+     {
+      mailPriceLevel = newLevel;
+      mailPriceMonitorInitialized = true;
+      Print("MY26 价格邮件监控已初始化: ", InpSymbol, " 价=", currentPrice, " 级别=", mailPriceLevel);
+      return;
+     }
+
+   if(newLevel == mailPriceLevel)
+      return;
+
+   datetime now = TimeCurrent();
+   int minSec = g_EmailPriceIntervalMin * 60;
+   int elapsed = (int)(now - mailLastPriceNotifyTime);
+
+   double oldRef = mailPriceLevel * step;
+   double newRef = newLevel * step;
+
+   if(elapsed >= minSec || mailLastPriceNotifyTime == 0)
+     {
+      string dir = (newLevel > mailPriceLevel) ? "上涨" : "下跌";
+      MailNotif_SendPriceInterval(currentPrice, oldRef, newRef, dir, now);
+      mailPriceLevel = newLevel;
+      mailLastPriceNotifyTime = now;
+     }
+   else
+     {
+      mailPriceLevel = newLevel;
+     }
+  }
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                   |
 //+------------------------------------------------------------------+
 int OnInit()
   {
    if(!IsTargetSymbol())
       return(INIT_FAILED);
+
+   if(InpEmailEnable)
+     {
+      int lenAddr = StringLen(InpEmailAddress);
+      if(lenAddr > 0 && StringFind(InpEmailAddress, "@") < 0)
+        {
+         Alert("MY26: 备注邮箱格式无效（含 @）");
+         return(INIT_PARAMETERS_INCORRECT);
+        }
+      if(!TerminalInfoInteger(TERMINAL_EMAIL_ENABLED))
+         Alert("MY26: 终端邮件未启用，请在 工具->选项->邮件 中配置 SMTP 与收件邮箱");
+     }
 
    trade.SetExpertMagicNumber(InpMagicNumber);
    fillingType = DetectFillingType();
@@ -423,6 +727,14 @@ int OnInit()
    ArrayResize(longTickets, 0);
    ArrayResize(shortTickets, 0);
    lastBarTime = 0;
+
+   mailLastPriceNotifyTime = 0;
+   mailPriceLevel = 0;
+   mailPriceMonitorInitialized = false;
+   if(InpEmailEnable)
+      MailNotif_SeedLastDealTime();
+   else
+      mailLastDealTime = 0;
 
    return(INIT_SUCCEEDED);
   }
@@ -447,6 +759,10 @@ void OnTick()
   {
    if(!IsTargetSymbol())
       return;
+
+// 价格区间邮件需每 tick 检查；交易逻辑仍在下方 IsNewBarM1 门控内
+   MailNotif_CheckPriceInterval();
+
    if(!IsNewBarM1())
       return;
 
@@ -549,6 +865,7 @@ void OnTick()
 void OnTrade()
   {
    SyncTracked();
+   MailNotif_ProcessDeals();
   }
 //+------------------------------------------------------------------+
 //| TradeTransaction function                                        |
