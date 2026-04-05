@@ -15,7 +15,6 @@ input double InpAtrMin            = 2.0;
 input int    InpMaFastPeriod      = 60;
 input int    InpMaSlowPeriod      = 250;
 input int    InpMaTrendBars       = 5;        // 5 根已收盘K线单调上升/下降
-input int    InpNoPendingDirection = 0;       // 无挂单时: 0=不交易, 1=仅允许多, -1=仅允许空（量化测试）
 input double InpSlAtrMult         = 16.0;     // 止损距离 = 该系数 × ATR(shift=1 已收盘)
 input double InpTpAtrMult         = 0.5;      // 止盈距离 = 该系数 × ATR(shift=1 已收盘)
 input double InpAoExtremeLong     = -1.0;
@@ -25,6 +24,9 @@ static const ENUM_TIMEFRAMES Tf = PERIOD_M1;
 
 // 挂单与现价最小距离（价格差，非 points）
 const double PENDING_DISTANCE = 2000.0;
+
+// 无挂单时: 0=不交易, 1=仅允许多, -1=仅允许空（量化测试）
+const int g_InpNoPendingDirection = 0;
 
 // true：开仓要求快线在最近 InpMaTrendBars 根已收盘K上方向单调；false：不检查快线单调，仅慢线单调仍参与
 bool g_RequireFastMaMonotonic = false;
@@ -242,18 +244,18 @@ bool PendingGate(double &lotsLong, double &lotsShort, bool &allowLong, bool &all
    int total = OrdersTotal();
    if(total <= 0)
      {
-      if(InpNoPendingDirection == 0)
+      if(g_InpNoPendingDirection == 0)
          return false;
       double minLot = SymbolInfoDouble(InpSymbol, SYMBOL_VOLUME_MIN);
       if(minLot <= 0.0)
          return false;
-      if(InpNoPendingDirection == 1)
+      if(g_InpNoPendingDirection == 1)
         {
          allowLong = true;
          lotsLong = minLot;
         }
       else
-         if(InpNoPendingDirection == -1)
+         if(g_InpNoPendingDirection == -1)
            {
             allowShort = true;
             lotsShort = minLot;
@@ -450,7 +452,7 @@ void OnTick()
 
    SyncTracked();
 
-// 挂单门控（无挂单时可通过 InpNoPendingDirection 强制单侧测试）
+// 挂单门控（无挂单时可通过 g_InpNoPendingDirection 强制单侧测试）
    double lotsLong = 0.0, lotsShort = 0.0;
    bool allowLong = false, allowShort = false;
    if(!PendingGate(lotsLong, lotsShort, allowLong, allowShort))
