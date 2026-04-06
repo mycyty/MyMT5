@@ -34,7 +34,6 @@ const double PENDING_DISTANCE = 2000.0;
 const bool   g_EmailNotifyOpen        = true;    // 开仓成交通知
 const bool   g_EmailNotifyClose       = true;    // 平仓成交通知
 const bool   g_EmailNotifyModify      = false;   // 修改/对冲类成交（INOUT）
-const bool   InpEmailPriceNotify       = false;   // 价格跨区间通知（每 tick，与 InpSymbol 一致）
 const int    g_EmailPriceIntervalMin  = 5;      // 价格邮件最小间隔（分钟）
 const double g_EmailPriceStep         = 5.0;    // 价格区间步长
 
