@@ -21,8 +21,9 @@ input double InpAoExtremeLong     = -1.0;
 input double InpAoExtremeShort    = 1.0;
 
 //--- 邮件通知（默认关闭，不改变交易逻辑；收件人实际以终端「工具→选项→邮件」为准）
-input bool   InpEmailEnable            = false;   // 启用邮件
-input string InpEmailAddress           = "";      // 备注用收件邮箱（SendMail 仍走终端配置）
+input bool   InpEmailEnable       = false;                   // 启用邮件
+input string InpEmailAddress      = "mycyty2@163.com";       // 备注用收件邮箱（SendMail 仍走终端配置）
+input bool   InpEmailPriceNotify  = false;                   // 价格跨区间通知（每 tick，与 InpSymbol 一致）
 
 static const ENUM_TIMEFRAMES Tf = PERIOD_M1;
 
@@ -33,12 +34,12 @@ const double PENDING_DISTANCE = 2000.0;
 const bool   g_EmailNotifyOpen        = true;    // 开仓成交通知
 const bool   g_EmailNotifyClose       = true;    // 平仓成交通知
 const bool   g_EmailNotifyModify      = false;   // 修改/对冲类成交（INOUT）
-const bool   g_EmailPriceNotify       = false;   // 价格跨区间通知（每 tick，与 InpSymbol 一致）
+const bool   InpEmailPriceNotify       = false;   // 价格跨区间通知（每 tick，与 InpSymbol 一致）
 const int    g_EmailPriceIntervalMin  = 5;      // 价格邮件最小间隔（分钟）
 const double g_EmailPriceStep         = 5.0;    // 价格区间步长
 
 // 无挂单时: 0=不交易, 1=仅允许多, -1=仅允许空（量化测试）
-const int g_InpNoPendingDirection = 0;
+const int g_InpNoPendingDirection = 1;
 
 // true：开仓要求快线在最近 InpMaTrendBars 根已收盘K上方向单调；false：不检查快线单调，仅慢线单调仍参与
 bool g_RequireFastMaMonotonic = false;
@@ -649,7 +650,7 @@ void MailNotif_SendPriceInterval(double currentPrice, double oldLevelPrice, doub
 //+------------------------------------------------------------------+
 void MailNotif_CheckPriceInterval()
   {
-   if(!InpEmailEnable || !g_EmailPriceNotify)
+   if(!InpEmailEnable || !InpEmailPriceNotify)
       return;
 
    double step = g_EmailPriceStep;
