@@ -17,8 +17,8 @@ input int    InpMaSlowPeriod      = 250;
 input int    InpMaTrendBars       = 5;        // 5 根已收盘K线单调上升/下降
 input double InpSlAtrMult         = 0.5;      // 止损：慢线 maSlow[1] 外侧该系数 × ATR(shift=1)
 input double InpTpAtrMult         = 6;        // 止盈距离 = 该系数 × ATR(shift=1 已收盘)
-input double InpAcExtremeLong     = -1.0;     // AC 极值过滤（多单）
-input double InpAcExtremeShort    = 1.0;      // AC 极值过滤（空单）
+input double InpAcExtremeLong     = -0.5;     // AC 极值过滤（多单）
+input double InpAcExtremeShort    = 0.5;      // AC 极值过滤（空单）
 
 //--- 邮件通知（默认关闭，不改变交易逻辑；收件人实际以终端「工具→选项→邮件」为准）
 input bool   InpEmailEnable       = false;                   // 启用邮件
@@ -37,7 +37,7 @@ const bool   g_EmailNotifyModify      = false;   // 修改/对冲类成交（INO
 const int    g_EmailPriceIntervalMin  = 5;      // 价格邮件最小间隔（分钟）
 const double g_EmailPriceStep         = 5.0;    // 价格区间步长
 
-// 无挂单时: 0=不交易, 1=仅允许多, -1=仅允许空（量化测试）
+// 无挂单时: 0=不交易, 1=仅允许多, -1=仅允许空，11=多空都做（量化测试）
 const int g_InpNoPendingDirection = 0;
 
 // true：开仓要求快线在最近 InpMaTrendBars 根已收盘K上方向单调；false：不检查快线单调，仅慢线单调仍参与
@@ -279,7 +279,15 @@ bool PendingGate(double &lotsLong, double &lotsShort, bool &allowLong, bool &all
             lotsShort = minLot;
            }
          else
-            return false;
+            if(g_InpNoPendingDirection == 11)
+              {
+               allowLong = true;
+               allowShort = true;
+               lotsLong = minLot;
+               lotsShort = minLot;
+              }
+            else
+               return false;
       return true;
      }
 
@@ -420,7 +428,7 @@ bool OpenSell(double vol, double tp, double sl)
   }
 
 //+------------------------------------------------------------------+
-//| 邮件：仅通知本 EA 魔术号 + InpSymbol 的成交（与 TradeMailNotification 同源逻辑） |
+//| 邮件：InpSymbol 上本 EA 魔术号或手动(0) 的成交                    |
 //+------------------------------------------------------------------+
 void MailNotif_SendTrade(ulong dealTicket, const string action, ENUM_DEAL_TYPE dealType, datetime dealTime)
   {
@@ -541,11 +549,11 @@ void MailNotif_ProcessDeals()
       if(dealTime <= mailLastDealTime)
          continue;
 
-      long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
-      if(dealMagic != InpMagicNumber)
+      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != InpSymbol)
          continue;
 
-      if(HistoryDealGetString(dealTicket, DEAL_SYMBOL) != InpSymbol)
+      long dealMagic = HistoryDealGetInteger(dealTicket, DEAL_MAGIC);
+      if(dealMagic != InpMagicNumber && dealMagic != 0)
          continue;
 
       ENUM_DEAL_TYPE dealType = (ENUM_DEAL_TYPE)HistoryDealGetInteger(dealTicket, DEAL_TYPE);
@@ -589,9 +597,10 @@ void MailNotif_SeedLastDealTime()
       ulong t = HistoryDealGetTicket(i);
       if(t == 0)
          continue;
-      if(HistoryDealGetInteger(t, DEAL_MAGIC) != InpMagicNumber)
-         continue;
       if(HistoryDealGetString(t, DEAL_SYMBOL) != InpSymbol)
+         continue;
+      long mg = HistoryDealGetInteger(t, DEAL_MAGIC);
+      if(mg != InpMagicNumber && mg != 0)
          continue;
       datetime dt = (datetime)HistoryDealGetInteger(t, DEAL_TIME);
       if(dt > maxT)
@@ -774,8 +783,8 @@ void OnTick()
    if(!PendingGate(lotsLong, lotsShort, allowLong, allowShort))
       return;
 
-// 两侧同时满足或两侧都不满足：不交易
-   if((allowLong && allowShort) || (!allowLong && !allowShort))
+// 两侧均不允许则不交易；有多、空挂单时两侧可同时为 true，信号互不排斥
+   if(!allowLong && !allowShort)
       return;
 
 // 指标取值：至少需要到 shift= (1 + trendBars) 与 AC shift+3
@@ -877,5 +886,6 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
                         const MqlTradeResult& result)
   {
    SyncTracked();
+   MailNotif_ProcessDeals();
   }
 //+------------------------------------------------------------------+
